@@ -1166,9 +1166,6 @@ class LockerGUI(AccessibleDialog):
 
                 if fresh_data:
                     self.cosmetics_data = fresh_data
-                    self.filtered_cosmetics = fresh_data.copy()
-                    self.stats = self._calculate_stats()
-                    self.update_list()
 
                     speaker.speak(f"Refreshed. {len(fresh_data)} cosmetics loaded.")
                     messageBox(

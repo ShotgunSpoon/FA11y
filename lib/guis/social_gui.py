@@ -1,0 +1,1080 @@
+"""
+Social Menu GUI for FA11y
+Provides interface for managing friends, party, and requests
+"""
+import logging
+import wx
+import threading
+import pyautogui
+from accessible_output2.outputs.auto import Auto
+
+from lib.guis.gui_utilities import (
+    AccessibleDialog, BoxSizerHelper, ButtonHelper,
+    messageBox, BORDER_FOR_DIALOGS
+)
+from lib.utilities.epic_social import Friend, FriendRequest, PartyMember, PartyInvite
+
+logger = logging.getLogger(__name__)
+speaker = Auto()
+
+
+class SocialDialog(AccessibleDialog):
+    """Dialog for managing social features"""
+
+    def __init__(self, parent, social_manager):
+        super().__init__(parent, title="Social Menu", helpId="SocialMenu")
+        self.social_manager = social_manager
+        self._is_destroying = False  # Flag to track if dialog is being destroyed
+        self.setupDialog()
+        self.SetSize((800, 600))
+        self.CentreOnParent()
+
+        # Type-to-search state
+        self.type_search_buffer = ""
+        self.type_search_timer = None
+
+        # Bind Escape key to close dialog
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
+        # Bind close event to mark destruction
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def makeSettings(self, sizer: BoxSizerHelper):
+        """Create dialog content"""
+
+        # Create notebook for tabs
+        self.notebook = wx.Notebook(self)
+        sizer.addItem(self.notebook, flag=wx.EXPAND, proportion=1)
+
+        # Create tabs
+        self.friends_panel = self._create_friends_panel()
+        self.requests_panel = self._create_requests_panel()
+        self.party_panel = self._create_party_panel()
+        self.me_panel = self._create_me_panel()
+
+        self.notebook.AddPage(self.friends_panel, "Friends")
+        self.notebook.AddPage(self.requests_panel, "Friend Requests")
+        self.notebook.AddPage(self.party_panel, "Party")
+        self.notebook.AddPage(self.me_panel, "Me")
+
+        # Bind tab change event
+        self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_tab_changed)
+
+    def _create_me_panel(self):
+        """Create Me tab showing account information in 3 separate boxes"""
+        panel = wx.Panel(self.notebook)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Title
+        title = wx.StaticText(panel, label="Account Information")
+        title_font = title.GetFont()
+        title_font.PointSize += 2
+        title_font = title_font.Bold()
+        title.SetFont(title_font)
+        sizer.Add(title, 0, wx.ALL, 10)
+
+        # Epic Account Stats Box
+        epic_label = wx.StaticText(panel, label="Epic Account Stats")
+        epic_label_font = epic_label.GetFont()
+        epic_label_font = epic_label_font.Bold()
+        epic_label.SetFont(epic_label_font)
+        sizer.Add(epic_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        self.epic_account_text = wx.TextCtrl(
+            panel,
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_WORDWRAP,
+            size=(-1, 80)
+        )
+        font = self.epic_account_text.GetFont()
+        font.PointSize += 1
+        self.epic_account_text.SetFont(font)
+        sizer.Add(self.epic_account_text, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Fortnite Stats Box
+        fn_label = wx.StaticText(panel, label="Fortnite Stats")
+        fn_label_font = fn_label.GetFont()
+        fn_label_font = fn_label_font.Bold()
+        fn_label.SetFont(fn_label_font)
+        sizer.Add(fn_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        self.fortnite_stats_text = wx.TextCtrl(
+            panel,
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_WORDWRAP,
+            size=(-1, 200)
+        )
+        font = self.fortnite_stats_text.GetFont()
+        font.PointSize += 1
+        self.fortnite_stats_text.SetFont(font)
+        sizer.Add(self.fortnite_stats_text, 1, wx.ALL | wx.EXPAND, 10)
+
+        # Fortnite Ranked Stats Box
+        ranked_label = wx.StaticText(panel, label="Fortnite Ranked Stats")
+        ranked_label_font = ranked_label.GetFont()
+        ranked_label_font = ranked_label_font.Bold()
+        ranked_label.SetFont(ranked_label_font)
+        sizer.Add(ranked_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+
+        self.ranked_stats_text = wx.TextCtrl(
+            panel,
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_WORDWRAP,
+            size=(-1, 150)
+        )
+        font = self.ranked_stats_text.GetFont()
+        font.PointSize += 1
+        self.ranked_stats_text.SetFont(font)
+        sizer.Add(self.ranked_stats_text, 1, wx.ALL | wx.EXPAND, 10)
+
+        # Refresh button
+        refresh_btn = wx.Button(panel, label="Refresh Account Information")
+        refresh_btn.Bind(wx.EVT_BUTTON, self.on_refresh_account_info)
+        sizer.Add(refresh_btn, 0, wx.ALL | wx.ALIGN_CENTER, 10)
+
+        panel.SetSizer(sizer)
+
+        # Set initial loading message (will be loaded when tab is first shown)
+        loading_msg = "Loading... (switch to this tab to load data)"
+        self.epic_account_text.SetValue(loading_msg)
+        self.fortnite_stats_text.SetValue(loading_msg)
+        self.ranked_stats_text.SetValue(loading_msg)
+
+        return panel
+
+    def _division_to_rank_name(self, division: int) -> str:
+        """
+        Convert division number to human-readable rank name
+        In Fortnite: I is lowest, II is middle, III is highest within each tier
+        """
+        if division == 0:
+            return "Unranked"
+        elif 1 <= division <= 3:
+            tier = ["I", "II", "III"][division - 1]
+            return f"Bronze {tier}"
+        elif 4 <= division <= 6:
+            tier = ["I", "II", "III"][division - 4]
+            return f"Silver {tier}"
+        elif 7 <= division <= 9:
+            tier = ["I", "II", "III"][division - 7]
+            return f"Gold {tier}"
+        elif 10 <= division <= 12:
+            tier = ["I", "II", "III"][division - 10]
+            return f"Platinum {tier}"
+        elif 13 <= division <= 15:
+            tier = ["I", "II", "III"][division - 13]
+            return f"Diamond {tier}"
+        elif division == 16:
+            return "Elite"
+        elif division == 17:
+            return "Champion"
+        elif division == 18:
+            return "Unreal"
+        else:
+            return f"Division {division}"
+
+    def _get_ranked_mode_name(self, ranking_type: str) -> str:
+        """Get friendly name for ranked mode"""
+        mode_names = {
+            'ranked-br': 'Battle Royale',
+            'ranked-zb': 'Zero Build',
+            'ranked_blastberry_build': 'Reload',
+            'ranked_blastberry_nobuild': 'Reload Zero Build',
+            'ranked-figment-build': 'OG',
+            'ranked-figment-nobuild': 'OG Zero Build'
+        }
+        return mode_names.get(ranking_type, ranking_type)
+
+    def load_account_info(self):
+        """Load account information from Epic Games API into 3 separate boxes"""
+        try:
+            # Get account info from social manager's auth
+            if not self.social_manager or not self.social_manager.auth:
+                self.epic_account_text.SetValue("Not authenticated. Please authenticate using ALT+SHIFT+V.")
+                self.fortnite_stats_text.SetValue("Not authenticated.")
+                self.ranked_stats_text.SetValue("Not authenticated.")
+                return
+
+            auth = self.social_manager.auth
+
+            # Check if auth is still valid before making API calls
+            if not auth.is_valid:
+                self.epic_account_text.SetValue("Authentication expired. Press ALT+E to re-authenticate.")
+                self.fortnite_stats_text.SetValue("Authentication expired.")
+                self.ranked_stats_text.SetValue("Authentication expired.")
+                return
+
+            account_info = auth.get_account_info()
+
+            if not account_info:
+                # Check if auth was invalidated during the request
+                if not auth.is_valid:
+                    self.epic_account_text.SetValue("Authentication expired. Press ALT+E to re-authenticate.")
+                    self.fortnite_stats_text.SetValue("Authentication expired.")
+                    self.ranked_stats_text.SetValue("Authentication expired.")
+                    return
+                self.epic_account_text.SetValue("Error loading account information. Please try refreshing.")
+                self.fortnite_stats_text.SetValue("Error loading stats.")
+                self.ranked_stats_text.SetValue("Error loading ranked stats.")
+                return
+
+            # === EPIC ACCOUNT STATS BOX (Simple: username, email, ID only) ===
+            epic_lines = []
+            epic_lines.append(f"Username: {account_info.get('displayName', 'N/A')}")
+            epic_lines.append(f"Email: {account_info.get('email', 'N/A')}")
+            epic_lines.append(f"Account ID: {account_info.get('id', 'N/A')}")
+
+            self.epic_account_text.SetValue("\n".join(epic_lines))
+            self.epic_account_text.SetInsertionPoint(0)
+
+            # === FORTNITE STATS BOX ===
+            player_stats = auth.get_player_stats()
+            fn_lines = []
+
+            if player_stats is None:
+                fn_lines.append("Error loading stats. Please try refreshing.")
+            elif player_stats.get('private'):
+                fn_lines.append("Statistics are set to private.")
+                fn_lines.append("Change privacy settings in-game to view stats.")
+            else:
+                # Overall Career Stats
+                fn_lines.append("OVERALL CAREER STATS")
+                fn_lines.append(f"Total Wins: {player_stats.get('wins', 0):,}")
+                fn_lines.append(f"Total Kills: {player_stats.get('kills', 0):,}")
+                fn_lines.append(f"Matches Played: {player_stats.get('matches_played', 0):,}")
+                fn_lines.append(f"K/D Ratio: {player_stats.get('kd_ratio', 0):.2f}")
+                fn_lines.append(f"Win Rate: {player_stats.get('win_rate', 0):.2f}%")
+
+                minutes = player_stats.get('minutes_played', 0)
+                hours = minutes / 60
+                days = hours / 24
+                fn_lines.append(f"Time Played: {minutes:,} minutes ({hours:.1f} hours / {days:.1f} days)")
+                fn_lines.append(f"Players Outlived: {player_stats.get('players_outlived', 0):,}")
+
+                # Per-Mode Breakdown
+                mode_breakdown = player_stats.get('mode_breakdown', {})
+                if mode_breakdown:
+                    # Check if any mode has stats
+                    has_mode_stats = any(
+                        mode_breakdown.get(mode, {}).get('matches', 0) > 0
+                        for mode in ['solo', 'duo', 'trio', 'squad']
+                    )
+
+                    if has_mode_stats:
+                        fn_lines.append("")
+                        fn_lines.append("PER-MODE BREAKDOWN")
+
+                        for mode_name in ['solo', 'duo', 'trio', 'squad']:
+                            mode_data = mode_breakdown.get(mode_name, {})
+                            if mode_data.get('matches', 0) > 0:
+                                mode_label = mode_name.capitalize() + "s" if mode_name != "solo" else "Solos"
+                                fn_lines.append(f"{mode_label}: {mode_data['wins']:,} wins, {mode_data['kills']:,} kills, {mode_data['matches']:,} matches (K/D: {mode_data['kd_ratio']:.2f}, WR: {mode_data['win_rate']:.1f}%)")
+
+                # Top Placements (only if there are any)
+                if any(player_stats.get(f'top{i}', 0) > 0 for i in [3, 5, 6, 10, 12, 25]):
+                    fn_lines.append("")
+                    fn_lines.append("TOP PLACEMENTS")
+                    if player_stats.get('top3', 0) > 0:
+                        fn_lines.append(f"Top 3: {player_stats['top3']:,}")
+                    if player_stats.get('top5', 0) > 0:
+                        fn_lines.append(f"Top 5: {player_stats['top5']:,}")
+                    if player_stats.get('top6', 0) > 0:
+                        fn_lines.append(f"Top 6: {player_stats['top6']:,}")
+                    if player_stats.get('top10', 0) > 0:
+                        fn_lines.append(f"Top 10: {player_stats['top10']:,}")
+                    if player_stats.get('top12', 0) > 0:
+                        fn_lines.append(f"Top 12: {player_stats['top12']:,}")
+                    if player_stats.get('top25', 0) > 0:
+                        fn_lines.append(f"Top 25: {player_stats['top25']:,}")
+
+                if player_stats.get('score', 0) > 0:
+                    fn_lines.append("")
+                    fn_lines.append(f"Total Score: {player_stats['score']:,}")
+
+            self.fortnite_stats_text.SetValue("\n".join(fn_lines))
+            self.fortnite_stats_text.SetInsertionPoint(0)
+
+            # === FORTNITE RANKED STATS BOX ===
+            ranked_data = auth.get_ranked_progress()
+            ranked_lines = []
+
+            if ranked_data is None:
+                ranked_lines.append("Error loading ranked stats. Please try refreshing.")
+            elif not ranked_data:
+                ranked_lines.append("No ranked data available.")
+                ranked_lines.append("Play ranked matches to see your progress here.")
+            else:
+                # Show each ranked mode with current rank and progress
+                for ranking_type in ['ranked-br', 'ranked-zb', 'ranked_blastberry_build',
+                                      'ranked_blastberry_nobuild', 'ranked-figment-build', 'ranked-figment-nobuild']:
+                    if ranking_type in ranked_data:
+                        mode_data = ranked_data[ranking_type]
+                        mode_name = self._get_ranked_mode_name(ranking_type)
+                        current_div = mode_data.get('currentDivision', 0)
+                        highest_div = mode_data.get('highestDivision', 0)
+                        progress = mode_data.get('promotionProgress', 0.0)
+
+                        # API uses 0-indexed divisions for ranked tiers
+                        # Division 1 = Bronze II, Division 2 = Bronze III, etc.
+                        # Add 1 to get the display rank
+                        current_rank = self._division_to_rank_name(current_div + 1)
+                        highest_rank = self._division_to_rank_name(highest_div + 1)
+
+                        # Format: "Battle Royale: Bronze II (20% to Bronze III)"
+                        if current_div > 0:
+                            # Show next rank
+                            next_div = current_div + 2  # +1 for offset, +1 for next tier
+                            next_rank = self._division_to_rank_name(next_div)
+                            progress_pct = int(progress * 100)
+                            ranked_lines.append(f"{mode_name}: {current_rank} ({progress_pct}% to {next_rank})")
+                        else:
+                            ranked_lines.append(f"{mode_name}: {current_rank}")
+
+                        # Show highest rank if different from current
+                        if highest_div > current_div:
+                            ranked_lines.append(f"  Peak: {highest_rank}")
+
+            self.ranked_stats_text.SetValue("\n".join(ranked_lines))
+            self.ranked_stats_text.SetInsertionPoint(0)
+
+            logger.info("Account information and stats loaded successfully")
+
+        except Exception as e:
+            logger.error(f"Error loading account info: {e}")
+            import traceback
+            traceback.print_exc()
+            self.epic_account_text.SetValue(f"Error: {str(e)}")
+            self.fortnite_stats_text.SetValue(f"Error: {str(e)}")
+            self.ranked_stats_text.SetValue(f"Error: {str(e)}")
+
+    def on_refresh_account_info(self, event):
+        """Refresh account information"""
+        speaker.speak("Refreshing account information")
+        self.load_account_info()
+        speaker.speak("Account information refreshed")
+
+    def _create_friends_panel(self):
+        """Create friends tab"""
+        panel = wx.Panel(self.notebook)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Filter buttons for All/Favorites
+        filter_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.all_friends_btn = wx.RadioButton(panel, label="All Friends", style=wx.RB_GROUP)
+        self.favorite_friends_btn = wx.RadioButton(panel, label="Favorites")
+        self.all_friends_btn.SetValue(True)
+        filter_sizer.Add(self.all_friends_btn, 0, wx.ALL, 5)
+        filter_sizer.Add(self.favorite_friends_btn, 0, wx.ALL, 5)
+        sizer.Add(filter_sizer, 0, wx.ALL, 5)
+
+        # Search box
+        search_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        search_label = wx.StaticText(panel, label="Search:")
+        search_sizer.Add(search_label, flag=wx.ALIGN_CENTER_VERTICAL | wx.ALL, border=5)
+
+        self.search_box = wx.TextCtrl(panel, size=(300, -1), style=wx.TE_PROCESS_ENTER)
+        self.search_box.Bind(wx.EVT_TEXT, self.on_search_changed)
+        self.search_box.Bind(wx.EVT_TEXT_ENTER, self.on_search_changed)  # Enter also triggers search
+        search_sizer.Add(self.search_box, flag=wx.ALIGN_CENTER_VERTICAL | wx.ALL, border=5)
+
+        clear_btn = wx.Button(panel, label="Clear")
+        clear_btn.Bind(wx.EVT_BUTTON, lambda e: self.search_box.SetValue(""))
+        search_sizer.Add(clear_btn, flag=wx.ALIGN_CENTER_VERTICAL | wx.ALL, border=5)
+
+        sizer.Add(search_sizer, 0, wx.EXPAND)
+
+        # Friends list (no online filter - presence API not available)
+        self.friends_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        sizer.Add(self.friends_list, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Action buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.add_friend_btn = wx.Button(panel, label="Add Friend")
+        self.invite_btn = wx.Button(panel, label="Invite to Party")
+        self.request_join_btn = wx.Button(panel, label="Request to Join")
+        self.remove_friend_btn = wx.Button(panel, label="Remove Friend")
+        btn_sizer.Add(self.add_friend_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(self.invite_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(self.request_join_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(self.remove_friend_btn, 0, wx.ALL, 5)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER, 5)
+
+        # Bind events
+        self.all_friends_btn.Bind(wx.EVT_RADIOBUTTON, self.refresh_friends_list)
+        self.favorite_friends_btn.Bind(wx.EVT_RADIOBUTTON, self.refresh_friends_list)
+        self.add_friend_btn.Bind(wx.EVT_BUTTON, self.on_add_friend)
+        self.invite_btn.Bind(wx.EVT_BUTTON, self.on_invite_to_party)
+        self.request_join_btn.Bind(wx.EVT_BUTTON, self.on_request_to_join)
+        self.remove_friend_btn.Bind(wx.EVT_BUTTON, self.on_remove_friend)
+        self.friends_list.Bind(wx.EVT_KEY_DOWN, self.on_friends_key_down)
+        self.friends_list.Bind(wx.EVT_LISTBOX_DCLICK, self.on_friends_double_click)
+
+        # Store search state
+        self.current_search = ""
+
+        panel.SetSizer(sizer)
+        return panel
+
+    def _create_requests_panel(self):
+        """Create friend requests tab"""
+        panel = wx.Panel(self.notebook)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Filter buttons
+        filter_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.incoming_req_btn = wx.RadioButton(panel, label="Incoming", style=wx.RB_GROUP)
+        self.outgoing_req_btn = wx.RadioButton(panel, label="Outgoing")
+        self.incoming_req_btn.SetValue(True)
+        filter_sizer.Add(self.incoming_req_btn, 0, wx.ALL, 5)
+        filter_sizer.Add(self.outgoing_req_btn, 0, wx.ALL, 5)
+        sizer.Add(filter_sizer, 0, wx.ALL, 5)
+
+        # Requests list
+        self.requests_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        sizer.Add(self.requests_list, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Action buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.accept_req_btn = wx.Button(panel, label="Accept")
+        self.decline_req_btn = wx.Button(panel, label="Decline")
+        btn_sizer.Add(self.accept_req_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(self.decline_req_btn, 0, wx.ALL, 5)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER, 5)
+
+        # Bind events
+        self.incoming_req_btn.Bind(wx.EVT_RADIOBUTTON, self.refresh_requests_list)
+        self.outgoing_req_btn.Bind(wx.EVT_RADIOBUTTON, self.refresh_requests_list)
+        self.accept_req_btn.Bind(wx.EVT_BUTTON, self.on_accept_request)
+        self.decline_req_btn.Bind(wx.EVT_BUTTON, self.on_decline_request)
+        self.requests_list.Bind(wx.EVT_KEY_DOWN, self.on_requests_key_down)
+
+        panel.SetSizer(sizer)
+        return panel
+
+    def _create_party_panel(self):
+        """Create party tab"""
+        panel = wx.Panel(self.notebook)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Party members list
+        self.party_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        sizer.Add(self.party_list, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Action buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.promote_btn = wx.Button(panel, label="Promote to Leader")
+        self.kick_btn = wx.Button(panel, label="Kick Member")
+        self.leave_party_btn = wx.Button(panel, label="Leave Party")
+        btn_sizer.Add(self.promote_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(self.kick_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(self.leave_party_btn, 0, wx.ALL, 5)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER, 5)
+
+        # Bind events
+        # Bind events
+        self.promote_btn.Bind(wx.EVT_BUTTON, self.on_promote_member)
+        self.kick_btn.Bind(wx.EVT_BUTTON, self.on_kick_member)
+        self.leave_party_btn.Bind(wx.EVT_BUTTON, self.on_leave_party)
+
+        panel.SetSizer(sizer)
+        return panel
+
+    def on_tab_changed(self, event):
+        """Handle tab change - refresh data asynchronously"""
+        page = event.GetSelection()
+
+        def _refresh_task():
+            if page == 0:  # Friends
+                self.social_manager.force_refresh_data("friends")
+                wx.CallAfter(self.refresh_friends_list)
+            elif page == 1:  # Requests
+                self.social_manager.force_refresh_data("requests")
+                wx.CallAfter(self.refresh_requests_list)
+            elif page == 2:  # Party
+                self.social_manager.force_refresh_data("party")
+                wx.CallAfter(self.refresh_party_list)
+            elif page == 3:  # Me tab
+                # Load account info (fresh data from API)
+                wx.CallAfter(self.load_account_info)
+
+        # Run refresh in background thread to avoid UI freeze
+        import threading
+        threading.Thread(target=_refresh_task, daemon=True).start()
+
+    def on_search_changed(self, event):
+        """Handle search text changes"""
+        self.current_search = self.search_box.GetValue()
+        self.refresh_friends_list()
+
+    def refresh_friends_list(self, event=None):
+        """Refresh friends list with filtering and search"""
+        # Check if dialog is being destroyed or widget is invalid
+        if self._is_destroying or not self.friends_list or not hasattr(self.friends_list, 'Clear'):
+            return
+
+        # Additional safety check - verify widget hasn't been deleted
+        try:
+            self.friends_list.GetCount()
+        except RuntimeError:
+            # Widget has been deleted
+            return
+
+        self.friends_list.Clear()
+
+        with self.social_manager.lock:
+            all_friends = list(self.social_manager.all_friends)
+
+        # Filter by favorites if selected
+        if self.favorite_friends_btn.GetValue():
+            friends = [f for f in all_friends if self.social_manager.is_favorite(f)]
+        else:
+            friends = all_friends
+
+        # Apply search filter
+        if self.current_search:
+            search_lower = self.current_search.lower()
+            friends = [f for f in friends if search_lower in (f.display_name or "").lower()]
+
+        # Sort favorites first, then alphabetically
+        def sort_key(friend):
+            is_fav = self.social_manager.is_favorite(friend)
+            name = (friend.display_name or friend.account_id or "Unknown").lower()
+            return (not is_fav, name)  # not is_fav so True (favorite) comes before False
+
+        friends.sort(key=sort_key)
+
+        # Add to list - screen readers will auto-announce position
+        for friend in friends:
+            name = friend.display_name or friend.account_id or "Unknown"
+            # Add star for favorites
+            if self.social_manager.is_favorite(friend):
+                label = f"★ {name}"
+            else:
+                label = name
+            self.friends_list.Append(label, friend)
+
+        if friends:
+            self.friends_list.SetSelection(0)
+            filter_type = "favorite friends" if self.favorite_friends_btn.GetValue() else "friends"
+            speaker.speak(f"{len(friends)} {filter_type}")
+        else:
+            filter_type = "favorite friends" if self.favorite_friends_btn.GetValue() else "friends"
+            speaker.speak(f"No {filter_type}")
+
+    def refresh_requests_list(self, event=None):
+        """Refresh requests list"""
+        # Check if dialog is being destroyed or widget is invalid
+        if self._is_destroying or not self.requests_list or not hasattr(self.requests_list, 'Clear'):
+            return
+
+        # Additional safety check - verify widget hasn't been deleted
+        try:
+            self.requests_list.GetCount()
+        except RuntimeError:
+            # Widget has been deleted
+            return
+
+        self.requests_list.Clear()
+
+        with self.social_manager.lock:
+            if self.incoming_req_btn.GetValue():
+                requests = list(self.social_manager.incoming_requests)
+                request_type = "incoming"
+            else:
+                requests = list(self.social_manager.outgoing_requests)
+                request_type = "outgoing"
+
+        # Use cached display names - screen readers will auto-announce position
+        for req in requests:
+            name = req.display_name or req.account_id or "Unknown"
+            direction = "from" if req.direction == "inbound" else "to"
+            label = f"Request {direction} {name}"
+            self.requests_list.Append(label, req)
+
+        if requests:
+            self.requests_list.SetSelection(0)
+            speaker.speak(f"{len(requests)} {request_type} requests")
+        else:
+            speaker.speak(f"No {request_type} friend requests")
+
+    def refresh_party_list(self, event=None):
+        """Refresh party members list"""
+        # Check if dialog is being destroyed or widget is invalid
+        if self._is_destroying or not self.party_list or not hasattr(self.party_list, 'Clear'):
+            return
+
+        # Additional safety check - verify widget hasn't been deleted
+        try:
+            self.party_list.GetCount()
+        except RuntimeError:
+            # Widget has been deleted
+            return
+
+        self.party_list.Clear()
+
+        with self.social_manager.lock:
+            members = list(self.social_manager.party_members)
+
+        # Use cached display names - screen readers will auto-announce position
+        for member in members:
+            name = member.display_name or member.account_id or "Unknown"
+            if member.is_leader:
+                label = f"{name} (Leader)"
+            else:
+                label = name
+            self.party_list.Append(label, member)
+
+        if members:
+            self.party_list.SetSelection(0)
+            speaker.speak(f"{len(members)} party members")
+            
+            # Check if we are leader
+            am_i_leader = False
+            my_id = self.social_manager.social_api.auth.account_id
+            for m in members:
+                if m.account_id == my_id and m.is_leader:
+                    am_i_leader = True
+                    break
+            
+            # Enable/Disable buttons based on leadership
+            if am_i_leader:
+                self.promote_btn.Enable()
+                self.kick_btn.Enable()
+            else:
+                self.promote_btn.Disable()
+                self.kick_btn.Disable()
+                
+        else:
+            speaker.speak("Not in a party")
+            self.promote_btn.Disable()
+            self.kick_btn.Disable()
+
+    def on_friends_key_down(self, event):
+        """Handle key press in friends list with arrow wrapping and type-to-search"""
+        keycode = event.GetKeyCode()
+
+        # Arrow key handling - consume them to prevent tab navigation
+        if keycode == wx.WXK_UP:
+            sel = self.friends_list.GetSelection()
+            if sel == 0 or sel == wx.NOT_FOUND:
+                # Wrap to last item
+                last = self.friends_list.GetCount() - 1
+                if last >= 0:
+                    self.friends_list.SetSelection(last)
+            else:
+                # Normal up navigation
+                self.friends_list.SetSelection(sel - 1)
+            return  # Don't Skip - prevents tab navigation
+
+        elif keycode == wx.WXK_DOWN:
+            sel = self.friends_list.GetSelection()
+            last = self.friends_list.GetCount() - 1
+            if sel == last or sel == wx.NOT_FOUND:
+                # Wrap to first item
+                self.friends_list.SetSelection(0)
+            else:
+                # Normal down navigation
+                self.friends_list.SetSelection(sel + 1)
+            return  # Don't Skip - prevents tab navigation
+
+        elif keycode == wx.WXK_LEFT or keycode == wx.WXK_RIGHT:
+            # Consume left/right to prevent tab switching
+            return
+
+        # Enter key sends party invite
+        elif keycode == wx.WXK_RETURN or keycode == wx.WXK_NUMPAD_ENTER:
+            self.on_invite_to_party(event)
+            return
+        # F key toggles favorite
+        elif keycode == ord('F'):
+            self.on_toggle_favorite(event)
+            return
+        # Type-to-search (alphanumeric keys)
+        elif keycode >= 32 and keycode <= 126:  # Printable ASCII
+            self._handle_type_to_search(chr(keycode), self.friends_list)
+            return
+
+        event.Skip()  # Allow other keys to be processed normally
+
+    def _handle_type_to_search(self, char, listbox):
+        """Handle type-to-search functionality for list boxes"""
+        # Cancel existing timer
+        if self.type_search_timer:
+            self.type_search_timer.Stop()
+            self.type_search_timer = None
+
+        # Add character to buffer
+        self.type_search_buffer += char.lower()
+
+        # Search for matching item
+        count = listbox.GetCount()
+        for i in range(count):
+            item_text = listbox.GetString(i).lower()
+            # Remove optional star prefix "★ "
+            if item_text.startswith("★ "):
+                item_text = item_text[2:].strip()
+
+            if item_text.startswith(self.type_search_buffer):
+                listbox.SetSelection(i)
+                # Speak the found item
+                speaker.speak(listbox.GetString(i))
+                break
+
+        # Set timer to clear buffer after 1 second of no typing
+        self.type_search_timer = wx.CallLater(1000, self._clear_type_search_buffer)
+
+    def _clear_type_search_buffer(self):
+        """Clear type-to-search buffer"""
+        self.type_search_buffer = ""
+        self.type_search_timer = None
+
+    def _refresh_after_operation(self, data_type):
+        """
+        Force backend refresh and update GUI after an operation
+
+        Args:
+            data_type: 'friends' or 'requests' to determine which data to refresh
+        """
+        if data_type == 'friends':
+            # Refresh friends data from backend
+            self.social_manager.refresh_slow_data()
+            # Update GUI
+            wx.CallAfter(self.refresh_friends_list)
+        elif data_type == 'requests':
+            # Refresh requests data from backend
+            self.social_manager.refresh_fast_data()
+            # Update GUI
+            wx.CallAfter(self.refresh_requests_list)
+
+    def on_requests_key_down(self, event):
+        """Handle key press in requests list with arrow wrapping and type-to-search"""
+        keycode = event.GetKeyCode()
+
+        # Arrow key handling - consume them to prevent tab navigation
+        if keycode == wx.WXK_UP:
+            sel = self.requests_list.GetSelection()
+            if sel == 0 or sel == wx.NOT_FOUND:
+                # Wrap to last item
+                last = self.requests_list.GetCount() - 1
+                if last >= 0:
+                    self.requests_list.SetSelection(last)
+            else:
+                # Normal up navigation
+                self.requests_list.SetSelection(sel - 1)
+            return  # Don't Skip - prevents tab navigation
+
+        elif keycode == wx.WXK_DOWN:
+            sel = self.requests_list.GetSelection()
+            last = self.requests_list.GetCount() - 1
+            if sel == last or sel == wx.NOT_FOUND:
+                # Wrap to first item
+                self.requests_list.SetSelection(0)
+            else:
+                # Normal down navigation
+                self.requests_list.SetSelection(sel + 1)
+            return  # Don't Skip - prevents tab navigation
+
+        elif keycode == wx.WXK_LEFT or keycode == wx.WXK_RIGHT:
+            # Consume left/right to prevent tab switching
+            return
+
+        # Enter key accepts request
+        elif keycode == wx.WXK_RETURN or keycode == wx.WXK_NUMPAD_ENTER:
+            self.on_accept_request(event)
+            return
+        # DEL key declines request
+        elif keycode == wx.WXK_DELETE or keycode == wx.WXK_NUMPAD_DELETE:
+            self.on_decline_request(event)
+            return
+        # Type-to-search (alphanumeric keys)
+        elif keycode >= 32 and keycode <= 126:  # Printable ASCII
+            self._handle_type_to_search(chr(keycode), self.requests_list)
+            return
+
+        event.Skip()  # Allow other keys to be processed normally
+
+    def on_toggle_favorite(self, event):
+        """Toggle selected friend as favorite"""
+        sel = self.friends_list.GetSelection()
+        if sel == wx.NOT_FOUND:
+            speaker.speak("No friend selected")
+            return
+
+        friend = self.friends_list.GetClientData(sel)
+        self.social_manager.toggle_favorite(friend)
+        # Refresh to update the star and sorting
+        wx.CallAfter(self.refresh_friends_list)
+
+    def on_close(self, event):
+        """Handle dialog close event"""
+        self._is_destroying = True
+        event.Skip()
+
+    def on_char_hook(self, event):
+        """Handle key press for dialog (Escape to close)"""
+        keycode = event.GetKeyCode()
+        if keycode == wx.WXK_ESCAPE:
+            self._is_destroying = True
+            self.EndModal(wx.ID_CANCEL)
+            wx.CallAfter(self._return_focus_to_game)
+        else:
+            event.Skip()
+
+    def _return_focus_to_game(self):
+        """Return focus to Fortnite using window management"""
+        try:
+            from lib.utilities.window_utils import focus_window
+            
+            # Try to focus Fortnite window directly
+            if focus_window("Fortnite"):
+                logger.debug("Focused Fortnite window")
+            else:
+                logger.debug("Could not find Fortnite window to focus")
+                # Fallback to click method if window not found
+                import time
+                pyautogui.moveTo(1850, 540)
+                pyautogui.click()
+            
+        except Exception as e:
+            logger.debug(f"Could not return focus to game: {e}")
+
+    def on_friends_double_click(self, event):
+        """Handle double-click on friend - sends party invite"""
+        self.on_invite_to_party(event)
+
+    def on_invite_to_party(self, event):
+        """Invite selected friend to party"""
+        sel = self.friends_list.GetSelection()
+        if sel == wx.NOT_FOUND:
+            speaker.speak("No friend selected")
+            return
+
+        friend = self.friends_list.GetClientData(sel)
+        self.social_manager._invite_friend_to_party(friend)
+
+    def on_request_to_join(self, event):
+        """Request to join selected friend's party"""
+        sel = self.friends_list.GetSelection()
+        if sel == wx.NOT_FOUND:
+            speaker.speak("No friend selected")
+            return
+
+        friend = self.friends_list.GetClientData(sel)
+        self.social_manager._request_to_join_party(friend)
+
+    def on_remove_friend(self, event):
+        """Remove selected friend"""
+        sel = self.friends_list.GetSelection()
+        if sel == wx.NOT_FOUND:
+            speaker.speak("No friend selected")
+            return
+
+        friend = self.friends_list.GetClientData(sel)
+        name = self.social_manager._ensure_display_name(friend.display_name)
+
+        dlg = wx.MessageDialog(
+            self,
+            f"Are you sure you want to remove {name} from your friends list?",
+            "Confirm Remove Friend",
+            wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION
+        )
+        result = dlg.ShowModal()
+        dlg.Destroy()
+
+        if result == wx.ID_YES:
+            self.social_manager._remove_friend(friend)
+            # Force immediate backend refresh then update GUI
+            wx.CallLater(500, self._refresh_after_operation, 'friends')
+
+    def on_add_friend(self, event):
+        """Open dialog to search and add friends"""
+        dlg = wx.TextEntryDialog(
+            self,
+            "Enter Epic Games username to search:",
+            "Add Friend"
+        )
+
+        if dlg.ShowModal() == wx.ID_OK:
+            username = dlg.GetValue().strip()
+            dlg.Destroy()
+
+            if not username:
+                speaker.speak("No username entered")
+                return
+
+            # Search for users
+            speaker.speak(f"Searching for {username}")
+            users = self.social_manager.social_api.search_users(username)
+
+            if not users:
+                speaker.speak(f"No users found matching {username}")
+                return
+
+            # If exact match found, use it
+            exact_match = None
+            for user in users:
+                if user["match_type"] == "exact":
+                    exact_match = user
+                    break
+
+            if exact_match:
+                # Send friend request to exact match
+                self.social_manager._send_friend_request_by_account_id(
+                    exact_match["account_id"],
+                    exact_match["display_name"]
+                )
+                wx.CallLater(1000, self.refresh_requests_list)
+            elif len(users) == 1:
+                # Only one result, use it
+                user = users[0]
+                self.social_manager._send_friend_request_by_account_id(
+                    user["account_id"],
+                    user["display_name"]
+                )
+                wx.CallLater(1000, self.refresh_requests_list)
+            else:
+                # Multiple results - show selection dialog
+                choices = [f"{u['display_name']} ({u['mutual_friends']} mutual friends)" for u in users]
+                dlg = wx.SingleChoiceDialog(
+                    self,
+                    f"Multiple users found. Select one:",
+                    "Select User",
+                    choices
+                )
+
+                if dlg.ShowModal() == wx.ID_OK:
+                    index = dlg.GetSelection()
+                    dlg.Destroy()
+                    selected_user = users[index]
+                    self.social_manager._send_friend_request_by_account_id(
+                        selected_user["account_id"],
+                        selected_user["display_name"]
+                    )
+                    wx.CallLater(1000, self.refresh_requests_list)
+                else:
+                    dlg.Destroy()
+                    speaker.speak("Cancelled")
+        else:
+            dlg.Destroy()
+            speaker.speak("Cancelled")
+
+    def on_accept_request(self, event):
+        """Accept selected request"""
+        sel = self.requests_list.GetSelection()
+        if sel == wx.NOT_FOUND:
+            speaker.speak("No request selected")
+            return
+
+        req = self.requests_list.GetClientData(sel)
+        if req.direction == "inbound":
+            self.social_manager._accept_friend_request(req)
+            # Force immediate backend refresh then update GUI
+            wx.CallLater(500, self._refresh_after_operation, 'requests')
+        else:
+            speaker.speak("Cannot accept outgoing request")
+
+    def on_decline_request(self, event):
+        """Decline selected request"""
+        sel = self.requests_list.GetSelection()
+        if sel == wx.NOT_FOUND:
+            speaker.speak("No request selected")
+            return
+
+        req = self.requests_list.GetClientData(sel)
+        self.social_manager._decline_friend_request(req)
+        # Force immediate backend refresh then update GUI
+        wx.CallLater(500, self._refresh_after_operation, 'requests')
+
+    def on_promote_member(self, event):
+        """Promote selected member to leader"""
+        sel = self.party_list.GetSelection()
+        if sel == wx.NOT_FOUND:
+            speaker.speak("No member selected")
+            return
+
+        member = self.party_list.GetClientData(sel)
+        if member.is_leader:
+            speaker.speak("Member is already the leader")
+            return
+
+        self.social_manager._promote_party_member(member)
+        wx.CallLater(1000, self.refresh_party_list)
+
+    def on_leave_party(self, event):
+        """Leave current party"""
+        with self.social_manager.lock:
+            if not self.social_manager.party_members:
+                speaker.speak("Not in a party")
+                return
+
+        dlg = wx.MessageDialog(
+            self,
+            "Are you sure you want to leave the party?",
+            "Confirm Leave Party",
+            wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION
+        )
+        result = dlg.ShowModal()
+        dlg.Destroy()
+
+        if result == wx.ID_YES:
+            self.social_manager.leave_party()
+            wx.CallLater(1000, self.refresh_party_list)
+
+    def on_kick_member(self, event):
+        """Kick selected member from party"""
+        sel = self.party_list.GetSelection()
+        if sel == wx.NOT_FOUND:
+            speaker.speak("No member selected")
+            return
+
+        member = self.party_list.GetClientData(sel)
+        
+        # Can't kick yourself (use leave instead)
+        if member.account_id == self.social_manager.social_api.auth.account_id:
+            speaker.speak("Cannot kick yourself. Use Leave Party instead.")
+            return
+
+        name = self.social_manager._ensure_display_name(member.display_name)
+
+        dlg = wx.MessageDialog(
+            self,
+            f"Are you sure you want to kick {name}?",
+            "Confirm Kick Member",
+            wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION
+        )
+        result = dlg.ShowModal()
+        dlg.Destroy()
+
+        if result == wx.ID_YES:
+            self.social_manager.kick_party_member(member.account_id)
+            wx.CallLater(1000, self.refresh_party_list)
+
+
+def show_social_gui(social_manager):
+    """Show the social menu GUI"""
+    try:
+        # Get or create wx App
+        app = wx.GetApp()
+        if app is None:
+            app = wx.App(False)
+
+        dialog = SocialDialog(None, social_manager)
+
+        # Focus window and center mouse
+        try:
+            from lib.guis.gui_utilities import ensure_window_focus_and_center_mouse
+            ensure_window_focus_and_center_mouse(dialog)
+        except Exception as e:
+            logger.debug(f"Could not focus window: {e}")
+
+        # Refresh the initial tab
+        dialog.refresh_friends_list()
+
+        dialog.ShowModal()
+        dialog.Destroy()
+
+        # Return focus to Fortnite after closing
+        try:
+            from lib.utilities.window_utils import focus_window
+            focus_window("Fortnite")
+        except Exception as e:
+            logger.debug(f"Could not return focus to game: {e}")
+    except Exception as e:
+        logger.error(f"Error showing social GUI: {e}")
+        speaker.speak("Error opening social menu")
